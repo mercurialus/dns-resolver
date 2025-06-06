@@ -1,9 +1,11 @@
 #include "include/dns_utils.h"
-#include <random>
+#include <iomanip>
+#include <iostream>
+#include <chrono>
+#include <ctime>
+#include <cctype>
 #include <vector>
 #include <string>
-#include <arpa/inet.h>
-#include <cstring>
 
 constexpr uint16_t PACKET_ID_MASK = 0xFFFF;
 constexpr uint8_t DNS_LABEL_POINTER_MASK = 0xC0;
@@ -59,4 +61,55 @@ std::string decode_domain(const std::vector<uint8_t> &data, size_t &offset)
         offset = orig_offset;
 
     return result;
+}
+
+std::string current_timestamp()
+{
+    auto now = std::chrono::system_clock::now();
+    auto time_t_now = std::chrono::system_clock::to_time_t(now);
+    auto tm_now = std::localtime(&time_t_now);
+
+    std::ostringstream oss;
+
+    oss << "[" << std::put_time(tm_now, "%Y-%m-%d %H:%M:%S") << "]";
+    return oss.str();
+}
+
+void log_info(const std::string &message)
+{
+    std::cout << current_timestamp() << " INFO: " << message << std::endl;
+}
+
+void log_error(const std::string &message)
+{
+    std::cerr << current_timestamp() << " ERROR:" << message << std::endl;
+}
+
+void dump_packet(std::vector<uint8_t> &data)
+{
+    const size_t bytes_per_line = 16;
+
+    for (size_t i = 0; i < data.size(); i += bytes_per_line)
+    {
+        std::cout << std::setw(4) << std::setfill('0') << std::hex << i << ": ";
+
+        for (size_t j = 0; j < bytes_per_line; ++j)
+        {
+            if (i + j < data.size())
+            {
+                std::cout << std::setw(2) << static_cast<int>(data[i + j]) << " ";
+            }
+            else
+            {
+                std::cout << " ";
+            }
+        }
+        std::cout << " ";
+        for (size_t j = 0; j < bytes_per_line && i + j < data.size(); ++j)
+        {
+            char c = static_cast<char>(data[i + j]);
+            std::cout << (std::isprint(static_cast<unsigned char>(c)) ? c : '.');
+        }
+        std::cout << std::endl;
+    }
 }
