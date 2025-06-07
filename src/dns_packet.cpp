@@ -1,6 +1,7 @@
-#include "include/dns_packet.h"
-#include "include/dns_utils.h"
+#include "dns_packet.h"
+#include "dns_utils.h"
 #include <random>
+#include <iostream>
 #include <vector>
 #include <string>
 #include <arpa/inet.h>
@@ -25,9 +26,9 @@ std::vector<uint8_t> build_query_packet(const std::string &domain, uint16_t qtyp
     header.id = htons(generate_transaction_id());
     header.flags = htons(0x0100); // rd = 1
     header.QDCOUNT = htons(1);
-    header.ANCOUNT = 0;
-    header.NSCOUNT = 0;
-    header.ARCOUNT = 0;
+    header.ANCOUNT = htons(0);
+    header.NSCOUNT = htons(0);
+    header.ARCOUNT = htons(0);
 
     packet.insert(packet.end(), reinterpret_cast<uint8_t *>(&header), reinterpret_cast<uint8_t *>(&header) + sizeof(DNSHeader));
     std::vector<uint8_t> qname = encode_domain(domain);
@@ -72,8 +73,8 @@ std::vector<std::string> parse_response(const std::vector<uint8_t> &data)
             break;
 
         uint16_t type = ntohs(*reinterpret_cast<const uint16_t *>(&data[offset]));
-        uint16_t class_code = ntohs(*reinterpret_cast<const uint16_t *>(&data[offset + 2]));
-        uint16_t ttl = ntohs(*reinterpret_cast<const uint16_t *>(&data[offset + 4]));
+        [[maybe_unused]] uint16_t class_code = ntohs(*reinterpret_cast<const uint16_t *>(&data[offset + 2]));
+        [[maybe_unused]] uint16_t ttl = ntohs(*reinterpret_cast<const uint16_t *>(&data[offset + 4]));
         uint16_t rdlength = ntohs(*reinterpret_cast<const uint16_t *>(&data[offset + 8]));
 
         offset += 10;

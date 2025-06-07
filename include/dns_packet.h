@@ -30,6 +30,7 @@ typedef struct DNSHeader
     uint16_t ARCOUNT;
 } DNSHeader;
 #pragma pack(pop)
+static_assert(sizeof(DNSHeader) == 12, "DNSHeader must be exactly 12 bytes");
 
 // DNS QUESTION STRUCT
 typedef struct DNSQuestion
