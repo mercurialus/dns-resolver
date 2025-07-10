@@ -8,25 +8,13 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unordered_set>
+#include <unordered_map>
+#include <unistd.h>
 
 static const std::vector<std::string> ROOT_SERVERS = {
     "1.1.1.1",
     "8.8.8.8",
-    "9.9.9.9",
-    "198.41.0.4",     // a.root-servers.net
-    "199.9.14.201",   // b.root-servers.net
-    "192.33.4.12",    // c.root-servers.net
-    "199.7.91.13",    // d.root-servers.net
-    "192.203.230.10", // e.root-servers.net
-    "192.5.5.241",    // f.root-servers.net
-    "192.112.36.4",   // g.root-servers.net
-    "198.97.190.53",  // h.root-servers.net
-    "192.36.148.17",  // i.root-servers.net
-    "192.58.128.30",  // j.root-servers.net
-    "193.0.14.129",   // k.root-servers.net
-    "199.7.83.42",    // l.root-servers.net
-    "202.12.27.33"    // m.root-servers.net
-};
+    "9.9.9.9"};
 
 // Helper to find glue A/AAAA records from additional section
 std::string get_glue_ip(const std::vector<DNSResourceRecord> &records, const std::string &ns_name)
@@ -53,113 +41,138 @@ std::string get_glue_ip(const std::vector<DNSResourceRecord> &records, const std
     return "";
 }
 
-// Recursive resolve, {this is tough man :( }
-std::vector<std::string> resolve(const std::string &domain, uint16_t record_type)
+// Recursive resolve, { this is tough man :( }
+// Credits for Comments: ChatGPT
+std::vector<std::string> resolve(const std::string &domain, uint16_t qtype)
 {
     std::unordered_set<std::string> visited_cnames;
-    std::vector<std::string> result;
-
     std::vector<std::string> nameservers = ROOT_SERVERS;
+
     while (!nameservers.empty())
     {
-        for (const auto &server_ip : nameservers)
+        for (const std::string &ns_ip : nameservers)
         {
-            auto query = build_query_packet(domain, record_type);
-            int sockfd = send_query(query, server_ip, 53);
+            /* 1. Send query ------------------------------------------------ */
+            std::vector<uint8_t> query = build_query_packet(domain, qtype);
+            int sockfd = send_query(query, ns_ip, 53);
             if (sockfd < 0)
                 continue;
 
-            auto raw_response = recv_response(sockfd, 3);
-            if (raw_response.empty())
+            std::vector<uint8_t> raw = recv_response(sockfd, 3);
+            close(sockfd);
+            if (raw.empty())
                 continue;
 
-            auto answers = parse_response(raw_response);
-            if (!answers.empty())
-                return answers;
-
-            DNSHeader header;
-
-            std::memcpy(&header, raw_response.data(), sizeof(DNSHeader));
-            size_t offset = sizeof(DNSHeader);
-
-            std::string question_name = decode_domain(raw_response, offset); // offset is updated inside
-            [[maybe_unused]] uint16_t qtype = (raw_response[offset] << 8) | raw_response[offset + 1];
-            [[maybe_unused]] uint16_t qclass = (raw_response[offset + 2] << 8) | raw_response[offset + 3];
-            offset += 4;
-
-            std::vector<DNSResourceRecord> authority, additional;
-
-            for (int i = 0; i < ntohs(header.ANCOUNT); ++i)
+            /* 2. Check if the answer we need is already here -------------- */
+            std::vector<std::string> ans = parse_response(raw, qtype); // <-- now supports A/AAAA/CNAME/MX
+            if (!ans.empty())
             {
-                decode_domain(raw_response, offset);
-                offset += 10; // type (2) + class (2) + ttl (4) + rdlength (2)
-                uint16_t rdlength = (raw_response[offset - 2] << 8) | raw_response[offset - 1];
-                offset += rdlength;
-            }
-
-            for (int i = 0; i < ntohs(header.NSCOUNT); ++i)
-            {
-                DNSResourceRecord rec;
-                rec.name = decode_domain(raw_response, offset);
-                rec.type = (raw_response[offset] << 8) | raw_response[offset + 1];
-                offset += 2;
-                rec.class_code = (raw_response[offset] << 8) | raw_response[offset + 1];
-                offset += 2;
-                rec.ttl = (raw_response[offset] << 24) | (raw_response[offset + 1] << 16) |
-                          (raw_response[offset + 2] << 8) | raw_response[offset + 3];
-                offset += 4;
-                rec.rdlength = (raw_response[offset] << 8) | raw_response[offset + 1];
-                offset += 2;
-                size_t rdata_offset = offset;
-                rec.rdata = std::vector<uint8_t>(raw_response.begin() + offset,
-                                                 raw_response.begin() + offset + rec.rdlength);
-                offset += rec.rdlength;
-                rec.name = decode_domain(raw_response, rdata_offset);
-                authority.push_back(rec);
-            }
-
-            for (int i = 0; i < ntohs(header.ARCOUNT); ++i)
-            {
-                DNSResourceRecord rec;
-                rec.name = decode_domain(raw_response, offset);
-                rec.type = (raw_response[offset] << 8) | raw_response[offset + 1];
-                offset += 2;
-                rec.class_code = (raw_response[offset] << 8) | raw_response[offset + 1];
-                offset += 2;
-                rec.ttl = (raw_response[offset] << 24) | (raw_response[offset + 1] << 16) |
-                          (raw_response[offset + 2] << 8) | raw_response[offset + 3];
-                offset += 4;
-                rec.rdlength = (raw_response[offset] << 8) | raw_response[offset + 1];
-                offset += 2;
-                rec.rdata = std::vector<uint8_t>(raw_response.begin() + offset,
-                                                 raw_response.begin() + offset + rec.rdlength);
-                offset += rec.rdlength;
-                additional.push_back(rec);
-            }
-            std::vector<std::string> new_ns_ips;
-            for (const auto &ns_rec : authority)
-            {
-                if (ns_rec.type == 2)
-                { // NS record
-                    std::string ns_name = ns_rec.name;
-                    // std::string ns_name(reinterpret_cast<const char *>(ns_rec.rdata.data()), ns_rec.rdata.size());
-                    std::string ip = get_glue_ip(additional, ns_name);
-                    if (ip.empty())
-                    {
-                        auto resolved = resolve(ns_name, 1);
-                        if (!resolved.empty())
-                            ip = resolved[0];
-                    }
-                    if (!ip.empty())
-                        new_ns_ips.push_back(ip);
+                /* Chase CNAME transparently for A/AAAA queries */
+                if ((qtype == 1 || qtype == 28) &&
+                    ans.size() == 1 && !is_ip_literal(ans[0]))
+                {
+                    const std::string &cname_target = ans[0];
+                    if (!visited_cnames.insert(cname_target).second)
+                        return {};                       // CNAME loop
+                    return resolve(cname_target, qtype); // recurse
                 }
+                return ans; // done (MX returns mail hosts, CNAME returns canonical name, etc.)
             }
-            if (!new_ns_ips.empty())
+
+            /* 3. Parse the referral (authority + additional) -------------- */
+            DNSHeader hdr;
+            std::memcpy(&hdr, raw.data(), sizeof(DNSHeader));
+            size_t off = sizeof(DNSHeader);
+
+            /* skip the question ------------------------------------------ */
+            (void)decode_domain(raw, off); // QNAME
+            off += 4;                      // QTYPE + QCLASS
+
+            /* skip any answer RRs (we just looked) ----------------------- */
+            for (int i = 0; i < ntohs(hdr.ANCOUNT); ++i)
+                skip_rr(raw, off);
+
+            /* ---- collect NS records from the authority section --------- */
+            struct NSInfo
             {
-                nameservers = new_ns_ips;
-                break;
+                std::string nsdname;
+            };
+            std::vector<NSInfo> authority;
+
+            for (int i = 0; i < ntohs(hdr.NSCOUNT); ++i)
+            {
+                size_t owner_off = off;
+                decode_domain(raw, off); // OWNER
+                uint16_t type = read16(raw, off);
+                off += 2;
+                off += 2 /*class*/ + 4 /*ttl*/;
+                uint16_t rdlen = read16(raw, off);
+                off += 2;
+                size_t rdata_off = off;
+
+                if (type == 2) // NS
+                {
+                    NSInfo info;
+                    info.nsdname = decode_domain(raw, rdata_off);
+                    authority.push_back(std::move(info));
+                }
+                off += rdlen;
+            }
+
+            /* ---- build glue cache from additional section -------------- */
+            std::unordered_map<std::string, std::string> glue;
+            for (int i = 0; i < ntohs(hdr.ARCOUNT); ++i)
+            {
+                std::string rrname = decode_domain(raw, off);
+                uint16_t type = read16(raw, off);
+                off += 2;
+                off += 2 /*class*/ + 4 /*ttl*/;
+                uint16_t rdlen = read16(raw, off);
+                off += 2;
+
+                if ((type == 1 || type == 28) && // A or AAAA
+                    rdlen == (type == 1 ? 4 : 16))
+                {
+                    char ipbuf[INET6_ADDRSTRLEN];
+                    inet_ntop(type == 1 ? AF_INET : AF_INET6,
+                              raw.data() + off,
+                              ipbuf,
+                              sizeof(ipbuf));
+                    glue[rrname] = ipbuf;
+                }
+                off += rdlen;
+            }
+
+            /* 4. Pick next name-server IPs -------------------------------- */
+            std::vector<std::string> next_hop;
+            for (const NSInfo &ns : authority)
+            {
+                std::string ip;
+
+                /* prefer glue */
+                auto it = glue.find(ns.nsdname);
+                if (it != glue.end())
+                {
+                    ip = it->second;
+                }
+                else // otherwise resolve NS name
+                {
+                    auto ips = resolve(ns.nsdname, 1); // recurse for A
+                    if (!ips.empty())
+                        ip = ips.front();
+                }
+
+                if (!ip.empty())
+                    next_hop.push_back(std::move(ip));
+            }
+
+            if (!next_hop.empty())
+            {
+                nameservers.swap(next_hop); // follow referral
+                break;                      // restart with new NS list
             }
         }
     }
-    return result;
+
+    return {}; // resolution failed
 }

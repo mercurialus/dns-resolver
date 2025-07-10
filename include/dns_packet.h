@@ -47,9 +47,11 @@ typedef struct DNSResourceRecord
     uint16_t class_code;
     uint32_t ttl;
     uint16_t rdlength;
+    std::string nsdname;
 
     std::vector<uint8_t> rdata;
 } DNSResourceRecord;
 
 std::vector<uint8_t> build_query_packet(const std::string &domain, uint16_t qtype);
-std::vector<std::string> parse_response(const std::vector<uint8_t> &data);
+std::vector<std::string> parse_response(const std::vector<uint8_t> &msg,
+                                        uint16_t expected_qtype = 0);

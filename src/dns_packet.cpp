@@ -6,15 +6,11 @@
 #include <string>
 #include <arpa/inet.h>
 #include <cstring>
-
-constexpr uint16_t PACKET_ID_MASK = 0xFFFF;
-constexpr uint8_t DNS_LABEL_POINTER_MASK = 0xC0;
-
 uint16_t generate_transaction_id()
 {
-    // for random number generator i am using mersenne twister
+    // for random number generator i am using Mersenne Twister
     static std::mt19937 rng(std::random_device{}());
-    static std::uniform_int_distribution<uint16_t> dist(0, 0xFFFF); // 0xFFFF=65535 == 2^16-1
+    static std::uniform_int_distribution<uint16_t> dist(0, 0xFFFF); // 0–65535
     return dist(rng);
 }
 
@@ -22,80 +18,129 @@ std::vector<uint8_t> build_query_packet(const std::string &domain, uint16_t qtyp
 {
     std::vector<uint8_t> packet;
 
-    DNSHeader header{};
-    header.id = htons(generate_transaction_id());
-    header.flags = htons(0x0100); // rd = 1
-    header.QDCOUNT = htons(1);
-    header.ANCOUNT = htons(0);
-    header.NSCOUNT = htons(0);
-    header.ARCOUNT = htons(0);
+    DNSHeader hdr{}; // zero-initialise
+    hdr.id = htons(generate_transaction_id());
+    hdr.flags = htons(0x0100); // RD = 1
+    hdr.QDCOUNT = htons(1);
 
-    packet.insert(packet.end(), reinterpret_cast<uint8_t *>(&header), reinterpret_cast<uint8_t *>(&header) + sizeof(DNSHeader));
+    packet.insert(packet.end(),
+                  reinterpret_cast<uint8_t *>(&hdr),
+                  reinterpret_cast<uint8_t *>(&hdr) + sizeof(DNSHeader));
+
     std::vector<uint8_t> qname = encode_domain(domain);
     packet.insert(packet.end(), qname.begin(), qname.end());
 
     uint16_t qtype_net = htons(qtype);
-    uint16_t qclass_net = htons(1);
+    uint16_t qclass_net = htons(1); // IN
 
-    packet.insert(packet.end(), reinterpret_cast<uint8_t *>(&qtype_net), reinterpret_cast<uint8_t *>(&qtype_net) + 2);
-    packet.insert(packet.end(), reinterpret_cast<uint8_t *>(&qclass_net), reinterpret_cast<uint8_t *>(&qclass_net) + 2);
+    packet.insert(packet.end(),
+                  reinterpret_cast<uint8_t *>(&qtype_net),
+                  reinterpret_cast<uint8_t *>(&qtype_net) + 2);
+    packet.insert(packet.end(),
+                  reinterpret_cast<uint8_t *>(&qclass_net),
+                  reinterpret_cast<uint8_t *>(&qclass_net) + 2);
 
     return packet;
 }
 
-std::vector<std::string> parse_response(const std::vector<uint8_t> &data)
+std::vector<std::string>
+parse_response(const std::vector<uint8_t> &msg,
+               uint16_t expected_qtype /* 0 = don’t filter */)
 {
-    std::vector<std::string> parsed;
+    std::vector<std::string> out;
+    if (msg.size() < sizeof(DNSHeader))
+        return out;
 
-    if (data.size() < sizeof(DNSHeader))
-        return parsed;
+    DNSHeader hdr;
+    std::memcpy(&hdr, msg.data(), sizeof(DNSHeader));
 
-    DNSHeader header;
+    size_t off = sizeof(DNSHeader);
+    uint16_t qd = ntohs(hdr.QDCOUNT);
+    uint16_t an = ntohs(hdr.ANCOUNT);
 
-    std::memcpy(&header, data.data(), sizeof(DNSHeader));
-
-    uint16_t qdcount = ntohs(header.QDCOUNT);
-    uint16_t ancount = ntohs(header.ANCOUNT);
-
-    size_t offset = sizeof(DNSHeader);
-
-    for (int i = 0; i < qdcount; ++i)
+    for (int i = 0; i < qd; ++i)
     {
-        decode_domain(data, offset);
-        offset += 4; // QTYPE (2) + QCLASS (2)
+        decode_domain(msg, off); // QNAME
+        off += 4;                // QTYPE + QCLASS
     }
 
-    for (int i = 0; i < ancount; ++i)
+    for (int i = 0; i < an; ++i)
     {
-        std::string name = decode_domain(data, offset);
+        decode_domain(msg, off); // OWNER (ignored)
 
-        if (offset + 10 > data.size())
-            break;
+        if (off + 10 > msg.size())
+            return out; // bounds check
 
-        uint16_t type = ntohs(*reinterpret_cast<const uint16_t *>(&data[offset]));
-        [[maybe_unused]] uint16_t class_code = ntohs(*reinterpret_cast<const uint16_t *>(&data[offset + 2]));
-        [[maybe_unused]] uint16_t ttl = ntohs(*reinterpret_cast<const uint16_t *>(&data[offset + 4]));
-        uint16_t rdlength = ntohs(*reinterpret_cast<const uint16_t *>(&data[offset + 8]));
+        uint16_t type = read_u16(msg, off);
+        off += 2;
+        [[maybe_unused]] uint16_t cls = read_u16(msg, off);
+        off += 2;
+        [[maybe_unused]] uint32_t ttl = read_u32(msg, off);
+        off += 4;
+        uint16_t rdlen = read_u16(msg, off);
+        off += 2;
 
-        offset += 10;
-        if (offset + rdlength > data.size())
-            break;
+        if (off + rdlen > msg.size())
+            return out; // truncated packet
 
-        if (type == 1 && rdlength == 4)
+        bool wanted = (expected_qtype == 0 ||
+                       expected_qtype == type ||
+                       ((expected_qtype == 1 || expected_qtype == 28) &&
+                        (type == 1 || type == 28)));
+
+        if (wanted)
         {
-            char ip[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &data[offset], ip, sizeof(ip));
-            parsed.emplace_back(ip);
-        }
-        else if (type == 5)
-        {
-            size_t cname_offset = offset;
-            std::string cname = decode_domain(data, cname_offset);
-            parsed.push_back(cname);
+            switch (type)
+            {
+            case 1: /* A ------------------------------------------------*/
+                if (rdlen == 4)
+                {
+                    char ip[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, msg.data() + off, ip, sizeof(ip));
+                    out.emplace_back(ip);
+                }
+                break;
+
+            case 28: /* AAAA ---------------------------------------------*/
+                if (rdlen == 16)
+                {
+                    char ip6[INET6_ADDRSTRLEN];
+                    inet_ntop(AF_INET6, msg.data() + off, ip6, sizeof(ip6));
+                    out.emplace_back(ip6);
+                }
+                break;
+
+            case 5: /* CNAME ------------------------------------------- */
+            {
+                size_t cname_off = off;
+                std::string cname = decode_domain(msg, cname_off);
+                out.emplace_back(std::move(cname));
+                break;
+            }
+
+            case 15: /* MX ---------------------------------------------- */
+            {
+                if (rdlen >= 3)
+                {
+                    uint16_t pref = read_u16(msg, off);
+                    size_t mx_off = off + 2;
+                    std::string exchange = decode_domain(msg, mx_off);
+
+                    /* Either store just the exchange host or include pref,
+                       depending on what your resolver expects. */
+                    out.emplace_back(exchange); // simple: just the host
+                }
+                break;
+            }
+
+            default:
+                /* ignore everything else */
+                break;
+            }
         }
 
-        offset += rdlength;
+        off += rdlen; // jump over RDATA
     }
 
-    return parsed;
+    return out;
 }
