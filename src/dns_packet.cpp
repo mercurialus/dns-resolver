@@ -1,16 +1,15 @@
 #include "dns_packet.h"
 #include "dns_utils.h"
 #include <random>
-#include <iostream>
 #include <vector>
 #include <string>
 #include <arpa/inet.h>
 #include <cstring>
+
 uint16_t generate_transaction_id()
 {
-    // for random number generator i am using Mersenne Twister
     static std::mt19937 rng(std::random_device{}());
-    static std::uniform_int_distribution<uint16_t> dist(0, 0xFFFF); // 0–65535
+    static std::uniform_int_distribution<uint16_t> dist(0, 0xFFFF);
     return dist(rng);
 }
 
@@ -18,9 +17,9 @@ std::vector<uint8_t> build_query_packet(const std::string &domain, uint16_t qtyp
 {
     std::vector<uint8_t> packet;
 
-    DNSHeader hdr{}; // zero-initialise
+    DNSHeader hdr{};
     hdr.id = htons(generate_transaction_id());
-    hdr.flags = htons(0x0100); // RD = 1
+    hdr.flags = htons(0x0100); // RD=1
     hdr.QDCOUNT = htons(1);
 
     packet.insert(packet.end(),
@@ -44,8 +43,7 @@ std::vector<uint8_t> build_query_packet(const std::string &domain, uint16_t qtyp
 }
 
 std::vector<std::string>
-parse_response(const std::vector<uint8_t> &msg,
-               uint16_t expected_qtype /* 0 = don’t filter */)
+parse_response(const std::vector<uint8_t> &msg, uint16_t expected_qtype)
 {
     std::vector<std::string> out;
     if (msg.size() < sizeof(DNSHeader))
@@ -66,22 +64,22 @@ parse_response(const std::vector<uint8_t> &msg,
 
     for (int i = 0; i < an; ++i)
     {
-        decode_domain(msg, off); // OWNER (ignored)
+        decode_domain(msg, off); // OWNER
 
         if (off + 10 > msg.size())
-            return out; // bounds check
+            return out;
 
         uint16_t type = read_u16(msg, off);
         off += 2;
-        [[maybe_unused]] uint16_t cls = read_u16(msg, off);
-        off += 2;
-        [[maybe_unused]] uint32_t ttl = read_u32(msg, off);
-        off += 4;
+        (void)read_u16(msg, off);
+        off += 2; // class
+        (void)read_u32(msg, off);
+        off += 4; // ttl
         uint16_t rdlen = read_u16(msg, off);
         off += 2;
 
         if (off + rdlen > msg.size())
-            return out; // truncated packet
+            return out;
 
         bool wanted = (expected_qtype == 0 ||
                        expected_qtype == type ||
@@ -92,7 +90,7 @@ parse_response(const std::vector<uint8_t> &msg,
         {
             switch (type)
             {
-            case 1: /* A ------------------------------------------------*/
+            case 1: // A
                 if (rdlen == 4)
                 {
                     char ip[INET_ADDRSTRLEN];
@@ -100,8 +98,7 @@ parse_response(const std::vector<uint8_t> &msg,
                     out.emplace_back(ip);
                 }
                 break;
-
-            case 28: /* AAAA ---------------------------------------------*/
+            case 28: // AAAA
                 if (rdlen == 16)
                 {
                     char ip6[INET6_ADDRSTRLEN];
@@ -109,37 +106,26 @@ parse_response(const std::vector<uint8_t> &msg,
                     out.emplace_back(ip6);
                 }
                 break;
-
-            case 5: /* CNAME ------------------------------------------- */
+            case 5: // CNAME
             {
                 size_t cname_off = off;
-                std::string cname = decode_domain(msg, cname_off);
-                out.emplace_back(std::move(cname));
+                out.emplace_back(decode_domain(msg, cname_off));
                 break;
             }
-
-            case 15: /* MX ---------------------------------------------- */
+            case 15: // MX
             {
                 if (rdlen >= 3)
                 {
-                    uint16_t pref = read_u16(msg, off);
-                    size_t mx_off = off + 2;
-                    std::string exchange = decode_domain(msg, mx_off);
-
-                    /* Either store just the exchange host or include pref,
-                       depending on what your resolver expects. */
-                    out.emplace_back(exchange); // simple: just the host
+                    size_t rdoff = off + 2; // skip preference
+                    out.emplace_back(decode_domain(msg, rdoff));
                 }
                 break;
             }
-
             default:
-                /* ignore everything else */
                 break;
             }
         }
-
-        off += rdlen; // jump over RDATA
+        off += rdlen;
     }
 
     return out;
